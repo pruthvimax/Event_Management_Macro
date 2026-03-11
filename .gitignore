@@ -2,6 +2,7 @@
 node_modules/
 dist/
 build/
+.vite/
 
 # Logs
 npm-debug.log*
@@ -36,5 +37,5 @@ coverage/
 tmp/
 temp/
 
-# Mongo local files
+# Mongo logs
 *.log
