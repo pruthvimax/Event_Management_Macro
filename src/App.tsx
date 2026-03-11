@@ -16,6 +16,7 @@ import {
 
 // --- Types ---
 interface User {
+  id: string;
   username: string;
   email: string;
   isAdmin: boolean;
@@ -32,6 +33,8 @@ interface Event {
   currentRSVPs: number;
   image_url?: string;
   category?: string;
+  participants?: string[];
+  waitlist?: string[];
 }
 
 type Theme = 'light' | 'dark' | 'system';
@@ -86,6 +89,23 @@ const Header = ({ user, onLogout, theme, setTheme }: { user: User | null, onLogo
       </div>
 
       <div className="flex items-center gap-6">
+        <div className="flex gap-4">
+          <button 
+            onClick={() => navigate('/dashboard')}
+            className="text-xs font-sans font-bold uppercase tracking-widest hover:text-black dark:hover:text-white transition-colors text-black/40 dark:text-white/40"
+          >
+            Dashboard
+          </button>
+          <button 
+            onClick={() => navigate('/my-events')}
+            className="text-xs font-sans font-bold uppercase tracking-widest hover:text-black dark:hover:text-white transition-colors text-black/40 dark:text-white/40"
+          >
+            My Events
+          </button>
+        </div>
+
+        <div className="h-6 w-px bg-black/10 dark:bg-white/10" />
+
         <div className="flex items-center bg-black/5 dark:bg-white/5 p-1 rounded-full">
           {(['light', 'dark', 'system'] as Theme[]).map((t) => (
             <button 
@@ -159,7 +179,7 @@ const AuthPage = ({ mode, onLogin }: { mode: 'login' | 'signup', onLogin: (user:
       
       if (res.ok) {
         if (mode === 'login') {
-          const userData = { ...data.user, token: data.token };
+          const userData = { ...data.user, id: data.user.id || data.id || '', token: data.token };
           localStorage.setItem('eventum_user', JSON.stringify(userData));
           onLogin(userData);
           // Role-based redirection
@@ -357,8 +377,8 @@ const Dashboard = ({ user }: { user: User }) => {
   const [searchQuery, setSearchQuery] = useState('');
   const [categoryFilter, setCategoryFilter] = useState('');
   const [loading, setLoading] = useState(true);
-  const [userRSVPs, setUserRSVPs] = useState<Set<string>>(new Set());
   const [rsvpLoading, setRsvpLoading] = useState<string | null>(null);
+  const [qrCodes, setQrCodes] = useState<Record<string, string>>({});
 
   useEffect(() => {
     fetchEvents();
@@ -376,7 +396,7 @@ const Dashboard = ({ user }: { user: User }) => {
         headers: { 'Authorization': `Bearer ${user.token}` }
       });
       if (!res.ok) {
-        console.error(`Fetch events failed: ${res.status} ${res.statusText}`);
+        throw new Error(`Fetch events failed: ${res.status} ${res.statusText}`);
       }
       const data = await res.json();
       setEvents(data);
@@ -388,14 +408,6 @@ const Dashboard = ({ user }: { user: User }) => {
   };
 
   const handleRSVP = async (id: string) => {
-    // Optimistic Update
-    const originalEvents = [...events];
-    const originalRSVPs = new Set(userRSVPs);
-
-    setEvents(prev => prev.map(e => 
-      e._id === id ? { ...e, currentRSVPs: e.currentRSVPs + 1 } : e
-    ));
-    setUserRSVPs(prev => new Set(prev).add(id));
     setRsvpLoading(id);
 
     try {
@@ -403,17 +415,22 @@ const Dashboard = ({ user }: { user: User }) => {
         method: 'POST',
         headers: { 'Authorization': `Bearer ${user.token}` }
       });
+      
+      const data = await res.json();
+      
       if (!res.ok) {
-        console.error(`RSVP failed: ${res.status} ${res.statusText}`);
-        const data = await res.json();
         throw new Error(data.error || 'Failed to RSVP');
       }
+
+      if (data.status === 'waitlisted') {
+        alert(data.message);
+      } else if (data.qr_code) {
+        setQrCodes(prev => ({ ...prev, [id]: data.qr_code }));
+      }
+      
       // Refresh to ensure sync with server
       fetchEvents();
     } catch (err: any) {
-      // Rollback
-      setEvents(originalEvents);
-      setUserRSVPs(originalRSVPs);
       alert(err.message);
     } finally {
       setRsvpLoading(null);
@@ -421,18 +438,6 @@ const Dashboard = ({ user }: { user: User }) => {
   };
 
   const handleCancel = async (id: string) => {
-    // Optimistic Update
-    const originalEvents = [...events];
-    const originalRSVPs = new Set(userRSVPs);
-
-    setEvents(prev => prev.map(e => 
-      e._id === id ? { ...e, currentRSVPs: Math.max(0, e.currentRSVPs - 1) } : e
-    ));
-    setUserRSVPs(prev => {
-      const next = new Set(prev);
-      next.delete(id);
-      return next;
-    });
     setRsvpLoading(id);
 
     try {
@@ -441,14 +446,17 @@ const Dashboard = ({ user }: { user: User }) => {
         headers: { 'Authorization': `Bearer ${user.token}` }
       });
       if (!res.ok) {
-        console.error(`Cancel RSVP failed: ${res.status} ${res.statusText}`);
         throw new Error('Failed to cancel RSVP');
       }
+      
+      setQrCodes(prev => {
+        const next = { ...prev };
+        delete next[id];
+        return next;
+      });
+
       fetchEvents();
     } catch (err: any) {
-      // Rollback
-      setEvents(originalEvents);
-      setUserRSVPs(originalRSVPs);
       alert(err.message);
     } finally {
       setRsvpLoading(null);
@@ -506,8 +514,13 @@ const Dashboard = ({ user }: { user: User }) => {
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8">
           <AnimatePresence mode="popLayout">
             {events.map((event, index) => {
-              const isFull = event.currentRSVPs >= event.maxCapacity;
-              const hasRSVPd = userRSVPs.has(event._id);
+              const participants = event.participants || [];
+              const waitlist = event.waitlist || [];
+              
+              const isFull = participants.length >= event.maxCapacity;
+              const hasRSVPd = participants.includes(user.id);
+              const isWaitlisted = waitlist.includes(user.id);
+              
               const isProcessing = rsvpLoading === event._id;
               
               return (
@@ -520,28 +533,30 @@ const Dashboard = ({ user }: { user: User }) => {
                   transition={{ delay: index * 0.05 }}
                   className="group bg-white dark:bg-white/5 rounded-[32px] p-8 shadow-sm hover:shadow-xl transition-all border border-black/5 dark:border-white/5 flex flex-col h-full relative overflow-hidden"
                 >
-                  {event.image_url && (
-                    <div className="-mx-8 -mt-8 mb-6 h-48 overflow-hidden relative rounded-t-[32px]">
-                      <img src={event.image_url} alt={event.title} className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-500" />
-                      {event.category && (
-                        <div className="absolute top-4 right-4 bg-white/90 dark:bg-black/90 backdrop-blur-sm px-3 py-1 rounded-full text-[10px] font-sans font-bold uppercase tracking-widest shadow-sm">
-                          {event.category}
-                        </div>
-                      )}
-                    </div>
-                  )}
-
-                  {!event.image_url && event.category && (
-                    <div className="mb-4 inline-block bg-black/5 dark:bg-white/10 px-3 py-1 rounded-full text-[10px] font-sans font-bold uppercase tracking-widest shadow-sm">
-                      {event.category}
-                    </div>
-                  )}
+                  <div className="-mx-8 -mt-8 mb-6 h-48 overflow-hidden relative rounded-t-[32px]">
+                    <img 
+                      src={event.image_url || 'https://images.unsplash.com/photo-1540575467063-178a50c2df87?w=800&q=80'} 
+                      alt={event.title} 
+                      className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-500" 
+                      onError={(e) => { e.currentTarget.src = 'https://images.unsplash.com/photo-1540575467063-178a50c2df87?w=800&q=80'; }}
+                    />
+                    {event.category && (
+                      <div className="absolute top-4 right-4 bg-white/90 dark:bg-black/90 backdrop-blur-sm px-3 py-1 rounded-full text-[10px] font-sans font-bold uppercase tracking-widest shadow-sm">
+                        {event.category}
+                      </div>
+                    )}
+                  </div>
 
                   <div className="flex justify-between items-start mb-6">
                     <div className="bg-[#F5F5F0] dark:bg-white/10 px-4 py-1 rounded-full text-xs font-sans font-bold uppercase tracking-widest">
                       {event.date}
                     </div>
-                    {isFull && !hasRSVPd && (
+                    {isWaitlisted && (
+                       <div className="bg-yellow-100 dark:bg-yellow-500/20 text-yellow-600 dark:text-yellow-400 px-3 py-1 rounded-full text-[10px] font-sans font-bold uppercase tracking-widest">
+                         Waitlisted (#{waitlist.indexOf(user.id) + 1})
+                       </div>
+                    )}
+                    {isFull && !hasRSVPd && !isWaitlisted && (
                       <div className="bg-red-100 dark:bg-red-500/20 text-red-600 dark:text-red-400 px-3 py-1 rounded-full text-[10px] font-sans font-bold uppercase tracking-widest">
                         Event Full
                       </div>
@@ -560,41 +575,173 @@ const Dashboard = ({ user }: { user: User }) => {
                     <div className="flex items-center justify-between">
                       <div className="flex items-center gap-2 text-sm font-sans font-semibold">
                         <Users size={16} className="text-[#5A5A40] dark:text-[#8A8A60]" />
-                        <span>{event.currentRSVPs} / {event.maxCapacity}</span>
+                        <span>{participants.length} / {event.maxCapacity}</span>
                       </div>
                       <div className="w-24 h-1 bg-black/5 dark:bg-white/5 rounded-full overflow-hidden">
                         <motion.div 
                           initial={{ width: 0 }}
-                          animate={{ width: `${(event.currentRSVPs / event.maxCapacity) * 100}%` }}
+                          animate={{ width: `${(participants.length / event.maxCapacity) * 100}%` }}
                           className="h-full bg-[#5A5A40] dark:bg-[#8A8A60]" 
                         />
                       </div>
                     </div>
 
-                    {hasRSVPd ? (
-                      <motion.button 
-                        whileTap={{ scale: 0.95 }}
-                        disabled={isProcessing}
-                        onClick={() => handleCancel(event._id)}
-                        className="w-full border border-red-200 dark:border-red-500/20 text-red-500 py-3 rounded-full text-xs font-sans font-bold uppercase tracking-widest hover:bg-red-50 dark:hover:bg-red-500/10 transition-all flex items-center justify-center gap-2"
-                      >
-                        {isProcessing ? 'Processing...' : 'Cancel Registration'}
-                      </motion.button>
+                    {(hasRSVPd || isWaitlisted) ? (
+                      <div className="space-y-4">
+                        {hasRSVPd && qrCodes[event._id] && (
+                          <div className="bg-white/5 p-4 rounded-xl border border-black/5 dark:border-white/5 flex flex-col items-center">
+                            <span className="text-[10px] font-sans font-bold uppercase tracking-widest opacity-50 mb-2">Your Entry Pass</span>
+                            <img src={qrCodes[event._id]} alt="Entry QR Code" className="w-32 h-32 rounded-lg" />
+                            <a href={qrCodes[event._id]} download={`event-pass-${event.title.replace(/\s+/g, '-').toLowerCase()}.png`} className="text-xs mt-3 text-blue-500 hover:underline">Download Pass</a>
+                          </div>
+                        )}
+                        <motion.button 
+                          whileTap={{ scale: 0.95 }}
+                          disabled={isProcessing}
+                          onClick={() => handleCancel(event._id)}
+                          className="w-full border border-red-200 dark:border-red-500/20 text-red-500 py-3 rounded-full text-xs font-sans font-bold uppercase tracking-widest hover:bg-red-50 dark:hover:bg-red-500/10 transition-all flex items-center justify-center gap-2"
+                        >
+                          {isProcessing ? 'Processing...' : (isWaitlisted ? 'Leave Waitlist' : 'Cancel Registration')}
+                        </motion.button>
+                      </div>
                     ) : (
                       <motion.button 
                         whileTap={{ scale: 0.95 }}
-                        disabled={isFull || isProcessing}
+                        disabled={isProcessing}
                         onClick={() => handleRSVP(event._id)}
                         className={`w-full py-3 rounded-full text-xs font-sans font-bold uppercase tracking-widest transition-all ${
                           isFull 
-                            ? 'bg-black/5 dark:bg-white/5 text-black/20 dark:text-white/20 cursor-not-allowed' 
+                            ? 'bg-black/5 dark:bg-white/5 text-[#5A5A40] dark:text-[#8A8A60] hover:bg-black/10 dark:hover:bg-white/10' 
                             : 'bg-black dark:bg-white text-white dark:text-black hover:bg-[#5A5A40] dark:hover:bg-[#8A8A60]'
                         }`}
                       >
-                        {isProcessing ? 'Processing...' : isFull ? 'Event Full' : 'RSVP Now'}
+                        {isProcessing ? 'Processing...' : isFull ? 'Join Waitlist' : 'RSVP Now'}
                       </motion.button>
                     )}
                   </div>
+                </motion.div>
+              );
+            })}
+          </AnimatePresence>
+        </div>
+      )}
+    </div>
+  );
+};
+
+const MyEvents = ({ user }: { user: User }) => {
+  const [events, setEvents] = useState<Event[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [qrCodes] = useState<Record<string, string>>({}); // QR codes could be fetched if persistence is required in later iterations
+
+  useEffect(() => {
+    fetchEvents();
+  }, []);
+
+  const fetchEvents = async () => {
+    setLoading(true);
+    try {
+      const res = await fetch('/api/my-events', {
+        headers: { 'Authorization': `Bearer ${user.token}` }
+      });
+      if (!res.ok) {
+        throw new Error(`Fetch my-events failed: ${res.status} ${res.statusText}`);
+      }
+      const data = await res.json();
+      setEvents(data || []);
+    } catch (err) {
+      console.error('Error fetching my events:', err);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="max-w-6xl mx-auto px-8 py-12">
+      <motion.header 
+        initial={{ opacity: 0, y: -20 }}
+        animate={{ opacity: 1, y: 0 }}
+        className="mb-12 flex flex-col md:flex-row md:items-end justify-between gap-8"
+      >
+        <div className="max-w-xl">
+          <h2 className="text-6xl font-light tracking-tight mb-4">My <span className="italic font-serif">Events</span></h2>
+          <p className="text-black/60 dark:text-white/60 text-lg">Experiences you are registered or waitlisted for.</p>
+        </div>
+      </motion.header>
+
+      {loading ? (
+        <div className="flex justify-center py-20">
+          <motion.div 
+            animate={{ rotate: 360 }}
+            transition={{ repeat: Infinity, duration: 1, ease: "linear" }}
+            className="rounded-full h-12 w-12 border-b-2 border-black dark:border-white"
+          ></motion.div>
+        </div>
+      ) : events.length === 0 ? (
+        <div className="text-center py-20 text-black/50 dark:text-white/50 font-sans">
+          <p>You haven't RSVP'd to any events yet.</p>
+        </div>
+      ) : (
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8">
+          <AnimatePresence mode="popLayout">
+            {events.map((event, index) => {
+              const participants = event.participants || [];
+              const waitlist = event.waitlist || [];
+              const isWaitlisted = waitlist.includes(user.id);
+              
+              return (
+                <motion.div
+                  key={event._id}
+                  layout
+                  initial={{ opacity: 0, y: 20 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0, scale: 0.9 }}
+                  transition={{ delay: index * 0.05 }}
+                  className="group bg-white dark:bg-white/5 rounded-[32px] p-8 shadow-sm hover:shadow-xl transition-all border border-black/5 dark:border-white/5 flex flex-col h-full relative overflow-hidden"
+                >
+                  <div className="-mx-8 -mt-8 mb-6 h-48 overflow-hidden relative rounded-t-[32px]">
+                    <img 
+                      src={event.image_url || 'https://images.unsplash.com/photo-1540575467063-178a50c2df87?w=800&q=80'} 
+                      alt={event.title} 
+                      className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-500" 
+                      onError={(e) => { e.currentTarget.src = 'https://images.unsplash.com/photo-1540575467063-178a50c2df87?w=800&q=80'; }}
+                    />
+                    {event.category && (
+                      <div className="absolute top-4 right-4 bg-white/90 dark:bg-black/90 backdrop-blur-sm px-3 py-1 rounded-full text-[10px] font-sans font-bold uppercase tracking-widest shadow-sm">
+                        {event.category}
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="flex justify-between items-start mb-6">
+                    <div className="bg-[#F5F5F0] dark:bg-white/10 px-4 py-1 rounded-full text-xs font-sans font-bold uppercase tracking-widest">
+                      {event.date}
+                    </div>
+                    {isWaitlisted ? (
+                      <div className="bg-yellow-100 dark:bg-yellow-500/20 text-yellow-600 dark:text-yellow-400 px-3 py-1 rounded-full text-[10px] font-sans font-bold uppercase tracking-widest flex items-center gap-1">
+                        Waitlisted
+                      </div>
+                    ) : (
+                      <div className="bg-green-100 dark:bg-green-500/20 text-green-600 dark:text-green-400 px-3 py-1 rounded-full text-[10px] font-sans font-bold uppercase tracking-widest flex items-center gap-1">
+                        ✔ Registered
+                      </div>
+                    )}
+                  </div>
+                  
+                  <h3 className="text-2xl font-bold mb-3 group-hover:text-[#5A5A40] dark:group-hover:text-[#8A8A60] transition-colors">{event.title}</h3>
+                  <div className="flex items-center gap-2 text-black/50 dark:text-white/50 text-sm mb-2 font-sans">
+                    <MapPin size={14} />
+                    {event.location}
+                  </div>
+                  <CountdownTimer dateString={event.date} />
+                  <p className="text-black/60 dark:text-white/60 text-sm mt-4 mb-4 flex-grow leading-relaxed italic line-clamp-3">{event.description}</p>
+                  
+                  {!isWaitlisted && qrCodes[event._id] && (
+                     <div className="mt-auto pt-4 border-t border-black/5 dark:border-white/5 flex flex-col items-center">
+                       <span className="text-[10px] font-sans font-bold uppercase tracking-widest opacity-50 mb-2">Your Entry Pass</span>
+                       <img src={qrCodes[event._id]} alt="Entry QR Code" className="w-24 h-24 rounded-lg" />
+                     </div>
+                  )}
                 </motion.div>
               );
             })}
@@ -754,15 +901,18 @@ const AdminPanel = ({ user }: { user: User }) => {
                     </td>
                     <td className="px-8 py-6">
                       <div className="flex items-center gap-3">
-                        <div className="text-sm font-bold">{event.currentRSVPs} / {event.maxCapacity}</div>
+                        <div className="text-sm font-bold">{(event.participants || []).length} / {event.maxCapacity}</div>
                         <div className="w-20 h-1 bg-black/5 dark:bg-white/5 rounded-full overflow-hidden">
                           <motion.div 
                             initial={{ width: 0 }}
-                            animate={{ width: `${(event.currentRSVPs / event.maxCapacity) * 100}%` }}
+                            animate={{ width: `${((event.participants || []).length / event.maxCapacity) * 100}%` }}
                             className="h-full bg-[#5A5A40]" 
                           />
                         </div>
                       </div>
+                      {(event.waitlist || []).length > 0 && (
+                        <div className="text-[10px] mt-2 opacity-50 uppercase tracking-widest font-bold font-sans">Waitlist: {(event.waitlist || []).length}</div>
+                      )}
                     </td>
                     <td className="px-8 py-6 text-right">
                       <div className="flex justify-end gap-2">
@@ -983,7 +1133,7 @@ const Footer = () => {
               <span className="bg-white/5 px-3 py-1 rounded-full text-[10px] font-bold uppercase tracking-widest border border-white/10">React 18</span>
               <span className="bg-white/5 px-3 py-1 rounded-full text-[10px] font-bold uppercase tracking-widest border border-white/10">Tailwind CSS</span>
             </div>
-            <p className="mt-6 text-xs text-white/30 italic">Developed by Pruthvi Alalli</p>
+
           </div>
         </div>
 
@@ -1103,6 +1253,13 @@ export default function App() {
             <ProtectedRoute>
               <Header user={user} onLogout={handleLogout} theme={theme} setTheme={setTheme} />
               <Dashboard user={user!} />
+            </ProtectedRoute>
+          } />
+
+          <Route path="/my-events" element={
+            <ProtectedRoute>
+              <Header user={user} onLogout={handleLogout} theme={theme} setTheme={setTheme} />
+              <MyEvents user={user!} />
             </ProtectedRoute>
           } />
 

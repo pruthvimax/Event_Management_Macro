@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -11,6 +12,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/golang-jwt/jwt/v4"
+	"github.com/skip2/go-qrcode"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
@@ -29,6 +31,8 @@ type Event struct {
 	CurrentRSVPs int                `bson:"current_rsvps" json:"current_rsvps"`
 	ImageURL     string             `bson:"image_url" json:"image_url"`
 	Category     string             `bson:"category" json:"category"`
+	Participants []string           `bson:"participants" json:"participants"`
+	Waitlist     []string           `bson:"waitlist" json:"waitlist"`
 }
 
 // User Struct - Core Auth Structure
@@ -82,6 +86,7 @@ func main() {
 	// 5. Protected Routes (User)
 	r.Group(func(r chi.Router) {
 		r.Use(authMiddleware)
+		r.Get("/api/my-events", getMyEvents)
 		r.Post("/api/events/{id}/rsvp", handleRSVP)
 		r.Post("/api/events/{id}/cancel", handleCancel)
 	})
@@ -194,9 +199,11 @@ func signIn(w http.ResponseWriter, r *http.Request) {
 
 	tokenString, _ := token.SignedString(jwtKey)
 
+	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"token": tokenString,
 		"user": map[string]interface{}{
+			"id":       user.ID.Hex(),
 			"username": user.Username,
 			"isAdmin":  user.IsAdmin,
 		},
@@ -213,6 +220,8 @@ func createEvent(w http.ResponseWriter, r *http.Request) {
 
 	event.ID = primitive.NewObjectID()
 	event.CurrentRSVPs = 0
+	event.Participants = make([]string, 0)
+	event.Waitlist = make([]string, 0)
 
 	_, err := collection.InsertOne(context.Background(), event)
 	if err != nil {
@@ -241,21 +250,68 @@ func notificationWorker() {
 // handleRSVP with Capacity Check and Mutex Protection
 func handleRSVP(w http.ResponseWriter, r *http.Request) {
 	idStr := chi.URLParam(r, "id")
-	id, _ := primitive.ObjectIDFromHex(idStr)
+	id, err := primitive.ObjectIDFromHex(idStr)
+	if err != nil {
+		http.Error(w, "Invalid Event ID", http.StatusBadRequest)
+		return
+	}
+
+	userClaims, ok := r.Context().Value("user").(jwt.MapClaims)
+	if !ok {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+	userID := userClaims["id"].(string)
+
+	fmt.Println("[DEBUG] handleRSVP UserID:", userID, "EventID:", idStr)
 
 	mu.Lock()
 	defer mu.Unlock()
 
 	var event Event
-	collection.FindOne(context.Background(), bson.M{"_id": id}).Decode(&event)
-
-	// Capacity Constraint Check
-	if event.CurrentRSVPs >= event.MaxCapacity {
-		http.Error(w, "Event is at full capacity", http.StatusConflict)
+	err = collection.FindOne(context.Background(), bson.M{"_id": id}).Decode(&event)
+	if err != nil {
+		fmt.Println("[DEBUG] Event not found:", idStr)
+		http.Error(w, "Event not found", http.StatusNotFound)
 		return
 	}
 
-	update := bson.M{"$inc": bson.M{"current_rsvps": 1}}
+	// Check if already in participants or waitlist
+	for _, p := range event.Participants {
+		if p == userID {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusConflict)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Already RSVP'd to this event"})
+			return
+		}
+	}
+	for _, wUser := range event.Waitlist {
+		if wUser == userID {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusConflict)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Already on the waitlist"})
+			return
+		}
+	}
+
+	// Capacity Constraint Check -> Add to participants or waitlist
+	if len(event.Participants) >= event.MaxCapacity {
+		update := bson.M{"$addToSet": bson.M{"waitlist": userID}}
+		collection.UpdateOne(context.Background(), bson.M{"_id": id}, update)
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		json.NewEncoder(w).Encode(map[string]string{
+			"status":  "waitlisted",
+			"message": "Event is full. You have been added to the waitlist.",
+		})
+		return
+	}
+
+	update := bson.M{
+		"$inc":       bson.M{"current_rsvps": 1},
+		"$addToSet": bson.M{"participants": userID},
+	}
 	collection.UpdateOne(context.Background(), bson.M{"_id": id}, update)
 
 	notificationChan <- Notification{
@@ -264,21 +320,122 @@ func handleRSVP(w http.ResponseWriter, r *http.Request) {
 		Time:    time.Now(),
 	}
 
-	w.WriteHeader(http.StatusAccepted)
+	// Generate QR Code: "eventID:userID"
+	qrData := fmt.Sprintf("%s:%s", idStr, userID)
+	png, err := qrcode.Encode(qrData, qrcode.Medium, 256)
+	if err != nil {
+		http.Error(w, "Failed to generate QR code", http.StatusInternalServerError)
+		return
+	}
+	base64QR := "data:image/png;base64," + base64.StdEncoding.EncodeToString(png)
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{
+		"message": "RSVP successful",
+		"qr_code": base64QR,
+	})
 }
 
-// handleCancel decrements the RSVP count
+// handleCancel decrements the RSVP count and manages waitlist promotion
 func handleCancel(w http.ResponseWriter, r *http.Request) {
 	idStr := chi.URLParam(r, "id")
 	id, _ := primitive.ObjectIDFromHex(idStr)
 
+	userClaims, ok := r.Context().Value("user").(jwt.MapClaims)
+	if !ok {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+	userID := userClaims["id"].(string)
+
 	mu.Lock()
 	defer mu.Unlock()
 
-	update := bson.M{"$inc": bson.M{"current_rsvps": -1}}
-	collection.UpdateOne(context.Background(), bson.M{"_id": id}, update)
+	var event Event
+	collection.FindOne(context.Background(), bson.M{"_id": id}).Decode(&event)
+
+	isParticipant := false
+	for _, p := range event.Participants {
+		if p == userID {
+			isParticipant = true
+			break
+		}
+	}
+
+	if isParticipant {
+		// Remove from participants
+		newParticipants := []string{}
+		for _, p := range event.Participants {
+			if p != userID {
+				newParticipants = append(newParticipants, p)
+			}
+		}
+
+		var update bson.M
+		if len(event.Waitlist) > 0 {
+			// Promote first waitlist user
+			nextUser := event.Waitlist[0]
+			newParticipants = append(newParticipants, nextUser)
+			newWaitlist := event.Waitlist[1:]
+
+			// Optional: Trigger notification to nextUser about promotion here
+
+			update = bson.M{
+				"$set": bson.M{
+					"participants": newParticipants,
+					"waitlist":     newWaitlist,
+				},
+			}
+		} else {
+			// No waitlist, just decrement
+			update = bson.M{
+				"$set": bson.M{"participants": newParticipants},
+				"$inc": bson.M{"current_rsvps": -1},
+			}
+		}
+		collection.UpdateOne(context.Background(), bson.M{"_id": id}, update)
+
+	} else {
+		// Try to remove from waitlist
+		update := bson.M{"$pull": bson.M{"waitlist": userID}}
+		collection.UpdateOne(context.Background(), bson.M{"_id": id}, update)
+	}
 
 	w.WriteHeader(http.StatusOK)
+}
+
+// getMyEvents handles fetching the events a user has RSVP'd to.
+func getMyEvents(w http.ResponseWriter, r *http.Request) {
+	userClaims, ok := r.Context().Value("user").(jwt.MapClaims)
+	if !ok {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+	userID := userClaims["id"].(string)
+
+	fmt.Println("[DEBUG] getMyEvents querying for UserID:", userID)
+
+	cursor, err := collection.Find(context.Background(), bson.M{"participants": userID})
+	if err != nil {
+		fmt.Println("[DEBUG] getMyEvents Find Error:", err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	var events []Event
+	if err = cursor.All(context.Background(), &events); err != nil {
+		fmt.Println("[DEBUG] getMyEvents Cursor Error:", err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	if events == nil {
+		events = make([]Event, 0)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(events)
 }
 
 // listEvents handles READ and SEARCH logic

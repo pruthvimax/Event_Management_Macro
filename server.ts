@@ -6,6 +6,7 @@ import path from "path";
 import cors from "cors";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
+import QRCode from "qrcode";
 
 dotenv.config();
 
@@ -33,7 +34,7 @@ const userSchema = new mongoose.Schema({
 
 const User = mongoose.model("User", userSchema);
 
-// Event Schema
+// Event Schema — includes all features: image, category, participants, waitlist
 const eventSchema = new mongoose.Schema({
   title: { type: String, required: true },
   date: { type: String, required: true },
@@ -41,6 +42,10 @@ const eventSchema = new mongoose.Schema({
   description: { type: String, required: true },
   maxCapacity: { type: Number, required: true, default: 50 },
   currentRSVPs: { type: Number, default: 0 },
+  image_url: { type: String, default: "" },
+  category: { type: String, default: "" },
+  participants: { type: [String], default: [] },
+  waitlist: { type: [String], default: [] },
   createdAt: { type: Date, default: Date.now }
 });
 
@@ -64,7 +69,8 @@ const isAdmin = (req: any, res: any, next: any) => {
   next();
 };
 
-// Auth Routes
+// --- Auth Routes ---
+
 app.post("/api/auth/signup", async (req, res) => {
   try {
     const { username, email, password, isAdmin } = req.body;
@@ -77,6 +83,7 @@ app.post("/api/auth/signup", async (req, res) => {
   }
 });
 
+// Sign in — returns id in user object so frontend can track RSVP state
 app.post("/api/auth/signin", async (req, res) => {
   try {
     const { email, password } = req.body;
@@ -84,26 +91,36 @@ app.post("/api/auth/signin", async (req, res) => {
     if (!user || !(await bcrypt.compare(password, user.password))) {
       return res.status(401).json({ error: "Invalid credentials" });
     }
-    const token = jwt.sign({ id: user._id, isAdmin: user.isAdmin, username: user.username }, JWT_SECRET);
-    res.json({ token, user: { username: user.username, isAdmin: user.isAdmin } });
+    const token = jwt.sign({ id: user._id.toString(), isAdmin: user.isAdmin, username: user.username }, JWT_SECRET);
+    res.json({
+      token,
+      user: {
+        id: user._id.toString(),
+        username: user.username,
+        isAdmin: user.isAdmin
+      }
+    });
   } catch (err) {
     res.status(500).json({ error: "Server error" });
   }
 });
 
-// API Routes
+// --- Event Routes ---
+
+// List events with optional search + category filter
 app.get("/api/events", async (req, res) => {
   try {
-    const { search } = req.query;
-    let query = {};
+    const { search, category } = req.query as { search?: string; category?: string };
+    const query: any = {};
     if (search) {
-      query = {
-        $or: [
-          { title: { $regex: search, $options: "i" } },
-          { description: { $regex: search, $options: "i" } },
-          { location: { $regex: search, $options: "i" } }
-        ]
-      };
+      query.$or = [
+        { title: { $regex: search, $options: "i" } },
+        { description: { $regex: search, $options: "i" } },
+        { location: { $regex: search, $options: "i" } }
+      ];
+    }
+    if (category) {
+      query.category = category;
     }
     const events = await Event.find(query).sort({ createdAt: -1 });
     res.json(events);
@@ -112,9 +129,27 @@ app.get("/api/events", async (req, res) => {
   }
 });
 
+// My Events — return events where the logged-in user is a participant
+app.get("/api/my-events", authenticate, async (req, res) => {
+  try {
+    const userID = (req as any).user.id;
+    console.log("[DEBUG] getMyEvents querying for UserID:", userID);
+    const events = await Event.find({ participants: userID });
+    res.json(events);
+  } catch (err) {
+    res.status(500).json({ error: "Failed to fetch my events" });
+  }
+});
+
+// Create event (admin only)
 app.post("/api/events", authenticate, isAdmin, async (req, res) => {
   try {
-    const newEvent = new Event(req.body);
+    const newEvent = new Event({
+      ...req.body,
+      currentRSVPs: 0,
+      participants: [],
+      waitlist: []
+    });
     await newEvent.save();
     console.log(`[ASYNC WORKER] New Event Created: ${newEvent.title}`);
     res.status(201).json(newEvent);
@@ -123,36 +158,103 @@ app.post("/api/events", authenticate, isAdmin, async (req, res) => {
   }
 });
 
+// Update event (admin only)
+app.put("/api/events/:id", authenticate, isAdmin, async (req, res) => {
+  try {
+    const updated = await Event.findByIdAndUpdate(req.params.id, req.body, { new: true });
+    res.json(updated);
+  } catch (err) {
+    res.status(400).json({ error: "Failed to update event" });
+  }
+});
+
+// RSVP — adds user to participants or waitlist; returns QR code on success
 app.post("/api/events/:id/rsvp", authenticate, async (req, res) => {
   try {
-    const event = await Event.findById(req.params.id);
+    const userID = (req as any).user.id;
+    const eventID = req.params.id;
+
+    console.log("[DEBUG] handleRSVP UserID:", userID, "EventID:", eventID);
+
+    const event = await Event.findById(eventID);
     if (!event) return res.status(404).json({ error: "Event not found" });
-    if (event.currentRSVPs >= event.maxCapacity) {
-      return res.status(409).json({ error: "Event is full" });
+
+    // Check if already registered or waitlisted
+    if (event.participants.includes(userID)) {
+      return res.status(409).json({ error: "Already RSVP'd to this event" });
     }
-    event.currentRSVPs += 1;
-    await event.save();
+    if (event.waitlist.includes(userID)) {
+      return res.status(409).json({ error: "Already on the waitlist" });
+    }
+
+    // If full — add to waitlist
+    if (event.participants.length >= event.maxCapacity) {
+      await Event.findByIdAndUpdate(eventID, { $addToSet: { waitlist: userID } });
+      return res.status(202).json({
+        status: "waitlisted",
+        message: "Event is full. You have been added to the waitlist."
+      });
+    }
+
+    // Add to participants
+    await Event.findByIdAndUpdate(eventID, {
+      $addToSet: { participants: userID },
+      $inc: { currentRSVPs: 1 }
+    });
+
     console.log(`[ASYNC WORKER] RSVP confirmed for: ${event.title}`);
-    res.json({ message: "RSVP successful" });
+
+    // Generate QR code: "eventID:userID"
+    const qrData = `${eventID}:${userID}`;
+    const qrCode = await QRCode.toDataURL(qrData);
+
+    res.json({ message: "RSVP successful", qr_code: qrCode });
   } catch (err) {
+    console.error("[ERROR] RSVP failed:", err);
     res.status(400).json({ error: "Failed to RSVP" });
   }
 });
 
+// Cancel RSVP — removes from participants or waitlist; promotes waitlisted user
 app.post("/api/events/:id/cancel", authenticate, async (req, res) => {
   try {
+    const userID = (req as any).user.id;
     const event = await Event.findById(req.params.id);
     if (!event) return res.status(404).json({ error: "Event not found" });
-    if (event.currentRSVPs > 0) {
-      event.currentRSVPs -= 1;
-      await event.save();
+
+    const isParticipant = event.participants.includes(userID);
+
+    if (isParticipant) {
+      // Remove from participants
+      const newParticipants = event.participants.filter((p: string) => p !== userID);
+
+      if (event.waitlist.length > 0) {
+        // Promote first waitlisted user
+        const [promoted, ...remainingWaitlist] = event.waitlist;
+        newParticipants.push(promoted);
+        await Event.findByIdAndUpdate(req.params.id, {
+          $set: { participants: newParticipants, waitlist: remainingWaitlist }
+        });
+      } else {
+        await Event.findByIdAndUpdate(req.params.id, {
+          $set: { participants: newParticipants },
+          $inc: { currentRSVPs: -1 }
+        });
+      }
+    } else {
+      // Remove from waitlist if present
+      await Event.findByIdAndUpdate(req.params.id, {
+        $pull: { waitlist: userID }
+      });
     }
+
     res.json({ message: "RSVP cancelled" });
   } catch (err) {
     res.status(400).json({ error: "Failed to cancel RSVP" });
   }
 });
 
+// Delete event (admin only)
 app.delete("/api/admin/delete-event/:id", authenticate, isAdmin, async (req, res) => {
   try {
     await Event.findByIdAndDelete(req.params.id);
