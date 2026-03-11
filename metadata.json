@@ -1,0 +1,5 @@
+{
+  "name": "Mini Event Management System",
+  "description": "A professional event management platform with RSVP tracking, built with a clean architecture and MongoDB integration.",
+  "requestFramePermissions": []
+}
