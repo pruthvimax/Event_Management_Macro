@@ -30,6 +30,8 @@ interface Event {
   description: string;
   maxCapacity: number;
   currentRSVPs: number;
+  image_url?: string;
+  category?: string;
 }
 
 type Theme = 'light' | 'dark' | 'system';
@@ -312,20 +314,64 @@ const AuthPage = ({ mode, onLogin }: { mode: 'login' | 'signup', onLogin: (user:
   );
 };
 
+const CountdownTimer = ({ dateString }: { dateString: string }) => {
+  const [timeLeft, setTimeLeft] = useState<{ days: number, hours: number, minutes: number, seconds: number } | null>(null);
+
+  useEffect(() => {
+    const eventDate = new Date(dateString).getTime();
+
+    const interval = setInterval(() => {
+      const now = new Date().getTime();
+      const difference = eventDate - now;
+
+      if (difference <= 0) {
+        setTimeLeft({ days: 0, hours: 0, minutes: 0, seconds: 0 });
+        clearInterval(interval);
+      } else {
+        const days = Math.floor(difference / (1000 * 60 * 60 * 24));
+        const hours = Math.floor((difference % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60));
+        const minutes = Math.floor((difference % (1000 * 60 * 60)) / (1000 * 60));
+        const seconds = Math.floor((difference % (1000 * 60)) / 1000);
+        setTimeLeft({ days, hours, minutes, seconds });
+      }
+    }, 1000);
+
+    return () => clearInterval(interval);
+  }, [dateString]);
+
+  if (!timeLeft) return null;
+
+  if (timeLeft.days === 0 && timeLeft.hours === 0 && timeLeft.minutes === 0 && timeLeft.seconds === 0) {
+    return <div className="text-[10px] font-sans font-bold uppercase tracking-widest text-[#5A5A40] dark:text-[#8A8A60] mt-2">Event Started</div>;
+  }
+
+  return (
+    <div className="text-[10px] font-sans font-bold uppercase tracking-widest text-black/60 dark:text-white/60 mt-2 bg-black/5 dark:bg-white/5 inline-block px-3 py-1 rounded-full">
+      Starts in: {timeLeft.days}d {timeLeft.hours}h {timeLeft.minutes}m {timeLeft.seconds}s
+    </div>
+  );
+};
+
 const Dashboard = ({ user }: { user: User }) => {
   const [events, setEvents] = useState<Event[]>([]);
   const [searchQuery, setSearchQuery] = useState('');
+  const [categoryFilter, setCategoryFilter] = useState('');
   const [loading, setLoading] = useState(true);
   const [userRSVPs, setUserRSVPs] = useState<Set<string>>(new Set());
   const [rsvpLoading, setRsvpLoading] = useState<string | null>(null);
 
   useEffect(() => {
     fetchEvents();
-  }, [searchQuery]);
+  }, [searchQuery, categoryFilter]);
 
   const fetchEvents = async () => {
+    setLoading(true);
     try {
-      const url = searchQuery ? `/api/events?search=${encodeURIComponent(searchQuery)}` : '/api/events';
+      const params = new URLSearchParams();
+      if (searchQuery) params.append('search', searchQuery);
+      if (categoryFilter) params.append('category', categoryFilter);
+      const url = params.toString() ? `/api/events?${params.toString()}` : '/api/events';
+
       const res = await fetch(url, {
         headers: { 'Authorization': `Bearer ${user.token}` }
       });
@@ -421,15 +467,30 @@ const Dashboard = ({ user }: { user: User }) => {
           <p className="text-black/60 dark:text-white/60 text-lg">Curated events for the modern architect. Search, discover, and RSVP to your next inspiration.</p>
         </div>
         
-        <div className="relative w-full md:w-80">
-          <Search className="absolute left-5 top-1/2 -translate-y-1/2 text-black/30 dark:text-white/30" size={18} />
-          <input 
-            type="text"
-            placeholder="Search events..."
-            value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
-            className="w-full bg-white dark:bg-white/5 border border-black/5 dark:border-white/5 rounded-full py-4 pl-14 pr-6 focus:ring-2 focus:ring-[#5A5A40] outline-none shadow-sm transition-all font-sans text-sm dark:text-white"
-          />
+        <div className="flex flex-col sm:flex-row gap-4 w-full md:w-auto">
+          <select
+            value={categoryFilter}
+            onChange={(e) => setCategoryFilter(e.target.value)}
+            className="bg-white dark:bg-white/5 border border-black/5 dark:border-white/5 rounded-full py-4 px-6 focus:ring-2 focus:ring-[#5A5A40] outline-none shadow-sm transition-all font-sans text-sm dark:text-white sm:w-48 appearance-none"
+            style={{ backgroundImage: `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'%3E%3C/polyline%3E%3C/svg%3E")`, backgroundRepeat: 'no-repeat', backgroundPosition: 'right 1.5rem center', backgroundSize: '1em' }}
+          >
+            <option value="">All Categories</option>
+            <option value="Tech">Tech</option>
+            <option value="Music">Music</option>
+            <option value="Workshop">Workshop</option>
+            <option value="Sports">Sports</option>
+          </select>
+
+          <div className="relative w-full sm:w-64 md:w-80">
+            <Search className="absolute left-5 top-1/2 -translate-y-1/2 text-black/30 dark:text-white/30" size={18} />
+            <input 
+              type="text"
+              placeholder="Search events..."
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              className="w-full bg-white dark:bg-white/5 border border-black/5 dark:border-white/5 rounded-full py-4 pl-14 pr-6 focus:ring-2 focus:ring-[#5A5A40] outline-none shadow-sm transition-all font-sans text-sm dark:text-white"
+            />
+          </div>
         </div>
       </motion.header>
 
@@ -459,6 +520,23 @@ const Dashboard = ({ user }: { user: User }) => {
                   transition={{ delay: index * 0.05 }}
                   className="group bg-white dark:bg-white/5 rounded-[32px] p-8 shadow-sm hover:shadow-xl transition-all border border-black/5 dark:border-white/5 flex flex-col h-full relative overflow-hidden"
                 >
+                  {event.image_url && (
+                    <div className="-mx-8 -mt-8 mb-6 h-48 overflow-hidden relative rounded-t-[32px]">
+                      <img src={event.image_url} alt={event.title} className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-500" />
+                      {event.category && (
+                        <div className="absolute top-4 right-4 bg-white/90 dark:bg-black/90 backdrop-blur-sm px-3 py-1 rounded-full text-[10px] font-sans font-bold uppercase tracking-widest shadow-sm">
+                          {event.category}
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {!event.image_url && event.category && (
+                    <div className="mb-4 inline-block bg-black/5 dark:bg-white/10 px-3 py-1 rounded-full text-[10px] font-sans font-bold uppercase tracking-widest shadow-sm">
+                      {event.category}
+                    </div>
+                  )}
+
                   <div className="flex justify-between items-start mb-6">
                     <div className="bg-[#F5F5F0] dark:bg-white/10 px-4 py-1 rounded-full text-xs font-sans font-bold uppercase tracking-widest">
                       {event.date}
@@ -471,11 +549,12 @@ const Dashboard = ({ user }: { user: User }) => {
                   </div>
                   
                   <h3 className="text-2xl font-bold mb-3 group-hover:text-[#5A5A40] dark:group-hover:text-[#8A8A60] transition-colors">{event.title}</h3>
-                  <div className="flex items-center gap-2 text-black/50 dark:text-white/50 text-sm mb-4 font-sans">
+                  <div className="flex items-center gap-2 text-black/50 dark:text-white/50 text-sm mb-2 font-sans">
                     <MapPin size={14} />
                     {event.location}
                   </div>
-                  <p className="text-black/60 dark:text-white/60 text-sm mb-8 flex-grow leading-relaxed italic line-clamp-3">{event.description}</p>
+                  <CountdownTimer dateString={event.date} />
+                  <p className="text-black/60 dark:text-white/60 text-sm mt-4 mb-8 flex-grow leading-relaxed italic line-clamp-3">{event.description}</p>
                   
                   <div className="flex flex-col gap-4 pt-6 border-t border-black/5 dark:border-white/5">
                     <div className="flex items-center justify-between">
@@ -536,7 +615,9 @@ const AdminPanel = ({ user }: { user: User }) => {
     date: '',
     location: '',
     description: '',
-    maxCapacity: 50
+    maxCapacity: 50,
+    image_url: '',
+    category: ''
   });
 
   useEffect(() => {
@@ -570,7 +651,7 @@ const AdminPanel = ({ user }: { user: User }) => {
         body: JSON.stringify(formData)
       });
       if (res.ok) {
-        setFormData({ title: '', date: '', location: '', description: '', maxCapacity: 50 });
+        setFormData({ title: '', date: '', location: '', description: '', maxCapacity: 50, image_url: '', category: '' });
         setShowForm(false);
         fetchEvents();
       }
@@ -778,6 +859,31 @@ const AdminPanel = ({ user }: { user: User }) => {
                     className="w-full bg-[#F5F5F0] dark:bg-white/5 border-none rounded-2xl px-6 py-4 focus:ring-2 focus:ring-[#5A5A40] outline-none transition-all dark:text-white"
                     placeholder="City, Venue"
                   />
+                </div>
+                <div>
+                  <label className="block text-xs font-sans font-bold uppercase tracking-widest mb-2 opacity-50 dark:text-white">Image URL</label>
+                  <input 
+                    type="url" 
+                    value={formData.image_url}
+                    onChange={(e) => setFormData({...formData, image_url: e.target.value})}
+                    className="w-full bg-[#F5F5F0] dark:bg-white/5 border-none rounded-2xl px-6 py-4 focus:ring-2 focus:ring-[#5A5A40] outline-none transition-all dark:text-white"
+                    placeholder="https://example.com/image.jpg"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-sans font-bold uppercase tracking-widest mb-2 opacity-50 dark:text-white">Category</label>
+                  <select
+                    value={formData.category}
+                    onChange={(e) => setFormData({...formData, category: e.target.value})}
+                    className="w-full bg-[#F5F5F0] dark:bg-white/5 border-none rounded-2xl px-6 py-4 focus:ring-2 focus:ring-[#5A5A40] outline-none transition-all dark:text-white appearance-none"
+                    style={{ backgroundImage: `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'%3E%3C/polyline%3E%3C/svg%3E")`, backgroundRepeat: 'no-repeat', backgroundPosition: 'right 1.5rem center', backgroundSize: '1em' }}
+                  >
+                    <option value="">Select a category</option>
+                    <option value="Tech">Tech</option>
+                    <option value="Music">Music</option>
+                    <option value="Workshop">Workshop</option>
+                    <option value="Sports">Sports</option>
+                  </select>
                 </div>
                 <div>
                   <label className="block text-xs font-sans font-bold uppercase tracking-widest mb-2 opacity-50 dark:text-white">Description</label>

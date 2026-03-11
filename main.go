@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"sync"
 	"time"
@@ -12,11 +11,11 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/golang-jwt/jwt/v4"
-	"golang.org/x/crypto/bcrypt"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
+	"golang.org/x/crypto/bcrypt"
 )
 
 // Event Struct - Core Data Structure
@@ -28,6 +27,8 @@ type Event struct {
 	Description  string             `bson:"description" json:"description"`
 	MaxCapacity  int                `bson:"max_capacity" json:"max_capacity"`
 	CurrentRSVPs int                `bson:"current_rsvps" json:"current_rsvps"`
+	ImageURL     string             `bson:"image_url" json:"image_url"`
+	Category     string             `bson:"category" json:"category"`
 }
 
 // User Struct - Core Auth Structure
@@ -212,7 +213,7 @@ func createEvent(w http.ResponseWriter, r *http.Request) {
 
 	event.ID = primitive.NewObjectID()
 	event.CurrentRSVPs = 0
-	
+
 	_, err := collection.InsertOne(context.Background(), event)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -283,17 +284,20 @@ func handleCancel(w http.ResponseWriter, r *http.Request) {
 // listEvents handles READ and SEARCH logic
 func listEvents(w http.ResponseWriter, r *http.Request) {
 	search := r.URL.Query().Get("search")
+	category := r.URL.Query().Get("category")
 	filter := bson.M{}
-	
+
 	if search != "" {
 		// Go Specialist Touch: Regex Search across multiple fields
-		filter = bson.M{
-			"$or": []bson.M{
-				{"title": bson.M{"$regex": search, "$options": "i"}},
-				{"description": bson.M{"$regex": search, "$options": "i"}},
-				{"location": bson.M{"$regex": search, "$options": "i"}},
-			},
+		filter["$or"] = []bson.M{
+			{"title": bson.M{"$regex": search, "$options": "i"}},
+			{"description": bson.M{"$regex": search, "$options": "i"}},
+			{"location": bson.M{"$regex": search, "$options": "i"}},
 		}
+	}
+
+	if category != "" {
+		filter["category"] = category
 	}
 
 	cursor, err := collection.Find(context.Background(), filter)
@@ -301,13 +305,13 @@ func listEvents(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	
+
 	var events []Event
 	if err = cursor.All(context.Background(), &events); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(events)
 }
@@ -316,23 +320,23 @@ func listEvents(w http.ResponseWriter, r *http.Request) {
 func updateEvent(w http.ResponseWriter, r *http.Request) {
 	idStr := chi.URLParam(r, "id")
 	id, _ := primitive.ObjectIDFromHex(idStr)
-	
+
 	var updateData bson.M
 	if err := json.NewDecoder(r.Body).Decode(&updateData); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	
+
 	// Remove ID from update data if present
 	delete(updateData, "id")
 	delete(updateData, "_id")
-	
+
 	_, err := collection.UpdateOne(context.Background(), bson.M{"_id": id}, bson.M{"$set": updateData})
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	
+
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -344,7 +348,7 @@ func deleteEvent(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Invalid ID format", http.StatusBadRequest)
 		return
 	}
-	
+
 	result, err := collection.DeleteOne(context.Background(), bson.M{"_id": id})
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -355,6 +359,6 @@ func deleteEvent(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Event not found", http.StatusNotFound)
 		return
 	}
-	
+
 	w.WriteHeader(http.StatusNoContent)
 }
